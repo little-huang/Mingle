@@ -1,5 +1,5 @@
-import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, extname, join } from "node:path";
@@ -60,10 +60,14 @@ async function videoPoster(path: string): Promise<{ seconds: string; poster: Buf
   for (const dir of FFMPEG_DIRS) {
     const out = join(tmpdir(), `mingle-poster-${randomUUID()}.jpg`);
     try {
-      const { stdout } = await run(join(dir, "ffprobe"),
-        ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path], { timeout: 20_000 });
-      await run(join(dir, "ffmpeg"), ["-y", "-v", "error", "-i", path, "-vframes", "1", "-q:v", "3", out],
-        { timeout: 30_000 });
+      const { stdout } = await run(
+        join(dir, "ffprobe"),
+        ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+        { timeout: 20_000 },
+      );
+      await run(join(dir, "ffmpeg"), ["-y", "-v", "error", "-i", path, "-vframes", "1", "-q:v", "3", out], {
+        timeout: 30_000,
+      });
       return { seconds: String(Math.max(1, Math.round(Number(stdout.trim()) || 1))), poster: await readFile(out) };
     } catch {
       // Not installed in this directory, or the file is not a readable video: try the next one.
@@ -122,6 +126,8 @@ export interface StreamClientLike {
   socketCallBackResponse(messageId: string, result: unknown): void;
   connect(): Promise<void>;
   disconnect(): void;
+  /** False while the socket is down (dingtalk-stream's `DWClient.connected`). */
+  connected?: boolean;
 }
 
 export function dingtalkApi(fetchImpl: Fetch = fetch) {
@@ -346,21 +352,40 @@ export function dingtalkChannel(options: DingtalkOptions = {}): Channel {
       const client = create({ clientId: keys.appKey, clientSecret: keys.appSecret });
       // dingtalk-stream reconnects via `setTimeout(this.connect)` and drops the promise, so one
       // failed endpoint fetch (a network blip) leaves inbound dead for good while sends still
-      // work (2026-11-27: TLS error at 11:18, messages @-ing the bot never arrived). Retry with backoff.
+      // work (2026-11-27: TLS error at 11:18, messages @-ing the bot never arrived). Its endpoint
+      // fetch also has no timeout and can hang just as silently (same day, 13:06-14:10: no socket,
+      // no error). So retry failures with backoff, and every 30 s reconnect a socket that is down
+      // with no attempt running, or whose attempt has been stuck for over a minute.
       const connectOnce = client.connect.bind(client);
       let closed = false;
       let retryMs = 1_000;
+      let attemptSince: number | undefined;
       client.connect = async () => {
+        const started = Date.now();
+        attemptSince = started;
         try {
           await connectOnce();
           retryMs = 1_000;
         } catch (error) {
-          if (closed) return;
+          if (closed || attemptSince !== started) return;
           console.error(`dingtalk stream reconnect failed, retrying in ${retryMs / 1000}s:`, error);
           setTimeout(() => void client.connect(), retryMs);
           retryMs = Math.min(retryMs * 2, 60_000);
+        } finally {
+          if (attemptSince === started) attemptSince = undefined;
         }
       };
+      const watchdog = setInterval(() => {
+        if (closed || client.connected !== false) return;
+        if (attemptSince !== undefined && Date.now() - attemptSince < 60_000) return;
+        console.error(
+          attemptSince === undefined
+            ? "dingtalk stream is down with no reconnect running; reconnecting"
+            : "dingtalk stream reconnect stuck for over a minute; starting another",
+        );
+        void client.connect();
+      }, 30_000);
+      watchdog.unref?.();
       /** Per inbound message: the conversation it came from and who sent it. */
       const origins = new Map<string, { conversationId: string; staffId?: string; nick?: string }>();
       /** Per group: the reply address of the latest message there, the only send that can @ people. */
@@ -496,7 +521,10 @@ export function dingtalkChannel(options: DingtalkOptions = {}): Channel {
             continue;
           }
           const mediaId = await api.uploadMedia(keys, { bytes: await readFile(file.path), name }, "image");
-          const named = new RegExp(`(!\\[[^\\]]*\\]\\()(?:[^)\\s]*/)?${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\)`, "g");
+          const named = new RegExp(
+            `(!\\[[^\\]]*\\]\\()(?:[^)\\s]*/)?${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\)`,
+            "g",
+          );
           if (named.test(text)) text = text.replace(named, `$1${mediaId})`);
           else tail.push(`![${name}](${mediaId})`);
         }
@@ -663,6 +691,7 @@ export function dingtalkChannel(options: DingtalkOptions = {}): Channel {
 
         async close() {
           closed = true;
+          clearInterval(watchdog);
           client.disconnect();
         },
       };

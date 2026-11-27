@@ -389,7 +389,11 @@ describe("message flow", () => {
     current = await rig(async (t) => {
       if (!t.input.includes("from Zhang")) return;
       const chat = /chat=(c\w+)/.exec(t.input)?.[1] as string;
-      const result = await runCli(t.options.env as Record<string, string>, ["message", "send", "--to", chat], "@Zhang San frozen, will tell you");
+      const result = await runCli(
+        t.options.env as Record<string, string>,
+        ["message", "send", "--to", chat],
+        "@Zhang San frozen, will tell you",
+      );
       expect(result.code).toBe(0);
     });
     const { channel, mingle } = current;

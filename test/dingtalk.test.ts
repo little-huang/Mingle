@@ -126,7 +126,9 @@ describe("dingtalk connection", () => {
         if (attempts === 2 || attempts === 3) throw new Error("socket disconnected before TLS");
       };
       const connection = await dingtalkChannel({
-        api: dingtalkApi(fakeHttp({ "/v1.0/oauth2/accessToken": () => ({ accessToken: "tok", expireIn: 7200 }) }).fetchImpl),
+        api: dingtalkApi(
+          fakeHttp({ "/v1.0/oauth2/accessToken": () => ({ accessToken: "tok", expireIn: 7200 }) }).fetchImpl,
+        ),
         createClient: () => stream.client,
       }).connect(
         { clientId: "ding1", clientSecret: "sec", name: "Alex" },
@@ -141,6 +143,49 @@ describe("dingtalk connection", () => {
       expect(attempts).toBe(4); // recovered
       await vi.advanceTimersByTimeAsync(60_000);
       expect(attempts).toBe(4); // no retries after success
+      expect(errors).toHaveBeenCalledTimes(2);
+      errors.mockRestore();
+      await connection.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reconnects a socket that went down silently or whose reconnect hangs", async () => {
+    vi.useFakeTimers();
+    try {
+      let attempts = 0;
+      const stream = fakeStream();
+      const client = stream.client as typeof stream.client & { connected?: boolean };
+      client.connected = true;
+      // attempt 1 is the first connect; attempt 2 hangs forever; attempt 3 succeeds
+      client.connect = () => {
+        attempts += 1;
+        if (attempts === 2) return new Promise<void>(() => {});
+        client.connected = true;
+        return Promise.resolve();
+      };
+      const connection = await dingtalkChannel({
+        api: dingtalkApi(
+          fakeHttp({ "/v1.0/oauth2/accessToken": () => ({ accessToken: "tok", expireIn: 7200 }) }).fetchImpl,
+        ),
+        createClient: () => client,
+      }).connect(
+        { clientId: "ding1", clientSecret: "sec", name: "Alex" },
+        { onMessage: () => {}, onState: () => {}, onMembership: () => {} },
+      );
+      const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(attempts).toBe(1); // up: the watchdog leaves it alone
+      client.connected = false; // socket closed and the library's own reconnect never ran
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(attempts).toBe(2); // watchdog reconnects; this attempt hangs
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(attempts).toBe(2); // still within a minute
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(attempts).toBe(3); // stuck over a minute: started another, which connects
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(attempts).toBe(3);
       expect(errors).toHaveBeenCalledTimes(2);
       errors.mockRestore();
       await connection.close();
@@ -264,7 +309,10 @@ describe("dingtalk connection", () => {
     expect(sent).toMatchObject([
       {
         msgKey: "sampleMarkdown",
-        msgParam: JSON.stringify({ title: "第 1 项", text: "第 1 项\n\n![图1](@media1)\n\n第 2 项\n\n![b.png](@media2)" }),
+        msgParam: JSON.stringify({
+          title: "第 1 项",
+          text: "第 1 项\n\n![图1](@media1)\n\n第 2 项\n\n![b.png](@media2)",
+        }),
       },
       { msgKey: "sampleFile" },
     ]);
