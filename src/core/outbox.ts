@@ -175,14 +175,14 @@ export class Outbox {
       if (result.kind === "uncertain") {
         store.setOutboundResult(record.id, "uncertain", null);
         sent.push(store.message(record.id) as Message);
-        if (!request.notice) this.markAnswered(agentId, chat.id, quoted);
+        if (!request.notice) this.markAnswered(agentId, chat.id, quoted, found.mentions);
         return report("uncertain");
       }
       const why = result.detail ? ` (${connection.platform}: ${result.detail})` : "";
       if (result.textSent) {
         // The person has the text; only the files are missing. Say so, so nobody sends it twice.
         store.setOutboundResult(record.id, "sent", result.textSent.platformId);
-        if (!request.notice) this.markAnswered(agentId, chat.id, quoted);
+        if (!request.notice) this.markAnswered(agentId, chat.id, quoted, found.mentions);
         throw new MingleError(
           `send_${result.code}`,
           `the text was delivered but the file was not${why}: ${failureNext(result.code, "file")}. ` +
@@ -193,7 +193,7 @@ export class Outbox {
       store.setOutboundResult(record.id, "failed", null);
       throw new MingleError(`send_${result.code}`, `${failureNext(result.code, "message")}${why}`, 502);
     }
-    if (!request.notice) this.markAnswered(agentId, chat.id, quoted);
+    if (!request.notice) this.markAnswered(agentId, chat.id, quoted, found.mentions);
     return report("sent");
   }
 
@@ -220,13 +220,22 @@ export class Outbox {
    * Not what the harness queued behind the running turn: the model has not read it yet, and once
    * marked replied a session restart could no longer hand it back, so it would be lost.
    */
-  private markAnswered(agentId: string, chatId: string, quoted: Message | undefined): void {
+  private markAnswered(
+    agentId: string,
+    chatId: string,
+    quoted: Message | undefined,
+    mentions: readonly Mention[] = [],
+  ): void {
+    // A send that @-mentions people answers what those people asked, not everyone in the chat:
+    // otherwise a message to one person closes another person's live reply with "answered below".
+    const to = new Set(mentions.map((m) => m.id));
     const answered = quoted
       ? this.store.moveInbound([quoted.id], "reply")
       : this.store.moveInbound(
           this.store
             .chatMessages(chatId, 200)
             .filter((m) => m.direction === "in" && !this.queued(agentId, m.id))
+            .filter((m) => to.size === 0 || (m.senderId !== null && to.has(m.senderId)))
             .map((m) => m.id),
           "send",
         );

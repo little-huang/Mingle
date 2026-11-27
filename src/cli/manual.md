@@ -208,7 +208,7 @@ BRIEF
 - When someone replies to the line's messages or to the message it came from, or writes in the work's thread, Mingle hands it to the line. Someone asking about that work in a fresh message: pass it on with `"$MINGLE_CLI" task tell t9 --from <message-id>` (a note on standard input is optional) and do not answer it yourself.
 - One line per message: a second `task run` for the same message is refused (`already_running`); pass what is new on with `task tell`.
 - When someone says to drop the work, close it: `"$MINGLE_CLI" task update t9 --status closed` stops the line at once.
-- At most three lines work at the same time; more wait their turn. `"$MINGLE_CLI" whoami` lists what you are doing.
+- At most fifty lines work at the same time; more wait their turn. `"$MINGLE_CLI" whoami` lists what you are doing.
 
 ## Reminders
 

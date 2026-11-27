@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { readFile, stat, writeFile } from "node:fs/promises";
-import { basename, extname } from "node:path";
+import { execFile } from "node:child_process";
+import { readFile, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, extname, join } from "node:path";
+import { promisify } from "node:util";
 import { DWClient, TOPIC_ROBOT } from "dingtalk-stream";
 import type {
   Capabilities,
@@ -45,6 +48,31 @@ const QR_MAX_MS = 15 * 60_000;
 const MAX_MEDIA_BYTES = 20 * 1024 * 1024;
 /** What the robot's image message (sampleImageMsg) shows inline; everything else goes as a file. */
 const IMAGE_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".gif", ".bmp"]);
+/** The app is started from Finder, so Homebrew's bin directories are not on its PATH. */
+const FFMPEG_DIRS = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"];
+
+/**
+ * An mp4's length in whole seconds and its first frame as a JPEG: a video message needs both.
+ * Undefined when ffmpeg is not installed or cannot read the file; the caller then sends a file.
+ */
+async function videoPoster(path: string): Promise<{ seconds: string; poster: Buffer } | undefined> {
+  const run = promisify(execFile);
+  for (const dir of FFMPEG_DIRS) {
+    const out = join(tmpdir(), `mingle-poster-${randomUUID()}.jpg`);
+    try {
+      const { stdout } = await run(join(dir, "ffprobe"),
+        ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path], { timeout: 20_000 });
+      await run(join(dir, "ffmpeg"), ["-y", "-v", "error", "-i", path, "-vframes", "1", "-q:v", "3", out],
+        { timeout: 30_000 });
+      return { seconds: String(Math.max(1, Math.round(Number(stdout.trim()) || 1))), poster: await readFile(out) };
+    } catch {
+      // Not installed in this directory, or the file is not a readable video: try the next one.
+    } finally {
+      await rm(out, { force: true });
+    }
+  }
+  return undefined;
+}
 
 const CAPABILITIES: Capabilities = {
   quoteReply: false,
@@ -144,7 +172,7 @@ export function dingtalkApi(fetchImpl: Fetch = fetch) {
   async function uploadMedia(
     c: { appKey: string; appSecret: string },
     file: { bytes: Buffer; name: string },
-    type: "image" | "file",
+    type: "image" | "file" | "video",
   ): Promise<string> {
     const url = new URL(`${REGISTRATION_BASE}/media/upload`);
     url.searchParams.set("access_token", await token(c.appKey, c.appSecret));
@@ -316,6 +344,23 @@ export function dingtalkChannel(options: DingtalkOptions = {}): Channel {
       const robotCode = credentials.robotCode ?? keys.appKey;
       await api.token(keys.appKey, keys.appSecret);
       const client = create({ clientId: keys.appKey, clientSecret: keys.appSecret });
+      // dingtalk-stream reconnects via `setTimeout(this.connect)` and drops the promise, so one
+      // failed endpoint fetch (a network blip) leaves inbound dead for good while sends still
+      // work (2026-11-27: TLS error at 11:18, messages @-ing the bot never arrived). Retry with backoff.
+      const connectOnce = client.connect.bind(client);
+      let closed = false;
+      let retryMs = 1_000;
+      client.connect = async () => {
+        try {
+          await connectOnce();
+          retryMs = 1_000;
+        } catch (error) {
+          if (closed) return;
+          console.error(`dingtalk stream reconnect failed, retrying in ${retryMs / 1000}s:`, error);
+          setTimeout(() => void client.connect(), retryMs);
+          retryMs = Math.min(retryMs * 2, 60_000);
+        }
+      };
       /** Per inbound message: the conversation it came from and who sent it. */
       const origins = new Map<string, { conversationId: string; staffId?: string; nick?: string }>();
       /** Per group: the reply address of the latest message there, the only send that can @ people. */
@@ -354,9 +399,9 @@ export function dingtalkChannel(options: DingtalkOptions = {}): Channel {
         }
         events.onMessage(inbound);
       });
-      await client.connect();
+      await connectOnce(); // first connect still fails loudly (bad keys, offline at start)
 
-      const sendRobot = async (chat: ChatRef, msgKey: string, param: Record<string, string>) => {
+      const sendRobot = async (chat: ChatRef, msgKey: string, param: Record<string, string | string[]>) => {
         const msgParam = JSON.stringify(param);
         if (chat.kind === "dm") {
           await api.call(keys, "v1.0/robot/oToMessages/batchSend", {
@@ -378,15 +423,21 @@ export function dingtalkChannel(options: DingtalkOptions = {}): Channel {
       const sendMarkdown = (chat: ChatRef, text: string) =>
         sendRobot(chat, "sampleMarkdown", { title: title(text), text });
       /**
-       * The robot send API has no `at`, so a group message that @-mentions people goes through the
-       * reply address of a recent message in that group: `@<staffId>` in the text plus `at.atUserIds`
-       * is what DingTalk turns into a mention that notifies. False when there is no usable address.
+       * A group message that @-mentions people: `@<staffId>` in the text plus the people's IDs is what
+       * DingTalk turns into a mention that notifies. It goes through the reply address of a recent
+       * message in that group when there is one, otherwise through the robot send API.
        */
       const sendMentioning = async (chat: ChatRef, text: string, mentions: readonly Mention[]): Promise<boolean> => {
         const session = sessions.get(chat.platformId);
-        if (!session || session.until < Date.now() + 30_000) return false;
         const ids = [...new Set(mentionSpots(text, mentions).map((s) => s.mention.id))];
         const body = renderMentions(text, mentions, (m) => `@${m.id}`);
+        // Without a live reply address (none since the last restart, or expired), the robot send API
+        // also mentions people when the markdown carries `atUserIds`: one message, no plain-text fallback.
+        const viaRobot = async () => {
+          await sendRobot(chat, "sampleMarkdown", { title: title(text), text: body, atUserIds: ids });
+          return true;
+        };
+        if (!session || session.until < Date.now() + 30_000) return viaRobot();
         try {
           await api.sendBySession(keys, session.address, {
             msgtype: "markdown",
@@ -395,11 +446,11 @@ export function dingtalkChannel(options: DingtalkOptions = {}): Channel {
           });
           return true;
         } catch (error) {
-          // DingTalk answered and turned it down (expired, revoked): nothing went out, send it plainly.
+          // DingTalk answered and turned it down (expired, revoked): nothing went out, send it by robot.
           // Without an answer it may have gone out; let the caller report that rather than send it twice.
           if ((error as { status?: number }).status === undefined) throw error;
           sessions.delete(chat.platformId);
-          return false;
+          return viaRobot();
         }
       };
       /** Each file is its own message: an inline image where DingTalk can show one, otherwise a file. */
@@ -409,14 +460,47 @@ export function dingtalkChannel(options: DingtalkOptions = {}): Channel {
         const name = file.name ?? basename(file.path);
         const extension = extname(name).toLowerCase();
         const bytes = await readFile(file.path);
+        const video = extension === ".mp4" ? await videoPoster(file.path) : undefined;
         if (IMAGE_EXTENSIONS.has(extension)) {
           const mediaId = await api.uploadMedia(keys, { bytes, name }, "image");
           await sendRobot(chat, "sampleImageMsg", { photoURL: mediaId });
+        } else if (video) {
+          // A video message plays inline in the chat; a file message only offers a download.
+          const videoMediaId = await api.uploadMedia(keys, { bytes, name }, "video");
+          const picMediaId = await api.uploadMedia(keys, { bytes: video.poster, name: "poster.jpg" }, "image");
+          await sendRobot(chat, "sampleVideo", { duration: video.seconds, videoMediaId, videoType: "mp4", picMediaId });
         } else {
           const mediaId = await api.uploadMedia(keys, { bytes, name }, "file");
           await sendRobot(chat, "sampleFile", { mediaId, fileName: name, fileType: extension.slice(1) || "file" });
         }
         return true;
+      };
+
+      /**
+       * Images sent with text go inside the markdown, so a report reads with its screenshots in place:
+       * `![图1](01-list.png)` naming an attached image becomes that upload, and attached images the
+       * text does not name are added after it. Other files, and images too large to upload, come back
+       * to be sent on their own.
+       */
+      const embedImages = async (
+        text: string,
+        files: readonly { path: string; name?: string }[],
+      ): Promise<{ text: string; rest: { path: string; name?: string }[] }> => {
+        const rest: { path: string; name?: string }[] = [];
+        const tail: string[] = [];
+        for (const file of files) {
+          const name = file.name ?? basename(file.path);
+          const { size } = await stat(file.path);
+          if (!IMAGE_EXTENSIONS.has(extname(name).toLowerCase()) || size === 0 || size > MAX_MEDIA_BYTES) {
+            rest.push(file);
+            continue;
+          }
+          const mediaId = await api.uploadMedia(keys, { bytes: await readFile(file.path), name }, "image");
+          const named = new RegExp(`(!\\[[^\\]]*\\]\\()(?:[^)\\s]*/)?${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\)`, "g");
+          if (named.test(text)) text = text.replace(named, `$1${mediaId})`);
+          else tail.push(`![${name}](${mediaId})`);
+        }
+        return { text: tail.length ? `${text}\n\n${tail.join("\n\n")}` : text, rest };
       };
 
       const emotion = async (platformMessageId: string, action: "reply" | "recall") => {
@@ -444,19 +528,22 @@ export function dingtalkChannel(options: DingtalkOptions = {}): Channel {
         async send(message: OutboundMessage): Promise<SendResult> {
           const degraded: Degradation[] = message.replyTo ? ["quote_dropped"] : [];
           let sentAny = false;
+          let files = message.files ?? [];
           try {
             if (message.text) {
+              const embedded = await embedImages(message.text, files);
+              files = embedded.rest;
               const mentioning =
                 message.chat.kind !== "dm" &&
                 message.mentions?.length &&
-                mentionSpots(message.text, message.mentions).length > 0;
-              if (!mentioning || !(await sendMentioning(message.chat, message.text, message.mentions ?? []))) {
-                await sendMarkdown(message.chat, message.text);
+                mentionSpots(embedded.text, message.mentions).length > 0;
+              if (!mentioning || !(await sendMentioning(message.chat, embedded.text, message.mentions ?? []))) {
+                await sendMarkdown(message.chat, embedded.text);
                 if (mentioning) degraded.push("mentions_plain");
               }
               sentAny = true;
             }
-            for (const file of message.files ?? []) {
+            for (const file of files) {
               if (await sendFile(message.chat, file)) sentAny = true;
               else if (!degraded.includes("files_dropped")) degraded.push("files_dropped");
             }
@@ -575,6 +662,7 @@ export function dingtalkChannel(options: DingtalkOptions = {}): Channel {
         },
 
         async close() {
+          closed = true;
           client.disconnect();
         },
       };

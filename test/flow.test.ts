@@ -383,6 +383,27 @@ describe("message flow", () => {
     expect(current.turns.map((turn) => turn.input.includes("queued-for-next-turn"))).toEqual([false, true]);
   });
 
+  it("counts a plain send that @-mentions someone as answering only that person", async () => {
+    // Two people write at once; the agent answers one with a plain send that @-mentions them.
+    // The other person's message must stay open, not be closed as "answered below".
+    current = await rig(async (t) => {
+      if (!t.input.includes("from Zhang")) return;
+      const chat = /chat=(c\w+)/.exec(t.input)?.[1] as string;
+      const result = await runCli(t.options.env as Record<string, string>, ["message", "send", "--to", chat], "@Zhang San frozen, will tell you");
+      expect(result.code).toBe(0);
+    });
+    const { channel, mingle } = current;
+    const zhang = channel.receive({ text: "from Zhang: freeze deploys" });
+    const li = channel.receive({ text: "from Li: fix the switch", sender: { id: "u2", name: "Li Si", isBot: false } });
+    await until(() => channel.sent.length === 1);
+    const chatId = mingle.store.agentChats(current.agentId)[0]?.id as string;
+    const id = (platformId: string) => mingle.store.messageByPlatformId(chatId, platformId)?.id as string;
+    await until(() => mingle.store.message(id(zhang.platformId))?.state === "replied");
+    // Li's message is still owed an answer, so the agent is reminded of it, and only of it.
+    const nudge = await until(() => current?.turns.find((t) => t.input.includes("Not answered yet")));
+    expect(nudge.input).toContain(`Not answered yet: ${id(li.platformId)}.`);
+  });
+
   it("quotes what a reply answers, so a bare '已授权' reads in context (MING-103)", async () => {
     current = await rig(async (t) => {
       if (!t.input.includes("download")) return;

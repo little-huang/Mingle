@@ -13,7 +13,7 @@ import type { Agent, Store, Task } from "../store/store.ts";
  */
 
 /** Lines of one agent working at the same time; more wait their turn. */
-export const MAX_LINES = 3;
+export const MAX_LINES = 50;
 
 export interface LineDeps {
   readonly store: Store;
