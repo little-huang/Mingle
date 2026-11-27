@@ -128,6 +128,8 @@ export interface StreamClientLike {
   disconnect(): void;
   /** False while the socket is down (dingtalk-stream's `DWClient.connected`). */
   connected?: boolean;
+  /** dingtalk-stream's keep-alive timer, left running when its socket closes. */
+  heartbeatIntervallId?: ReturnType<typeof setInterval>;
 }
 
 export function dingtalkApi(fetchImpl: Fetch = fetch) {
@@ -356,6 +358,9 @@ export function dingtalkChannel(options: DingtalkOptions = {}): Channel {
       // fetch also has no timeout and can hang just as silently (same day, 13:06-14:10: no socket,
       // no error). So retry failures with backoff, and every 30 s reconnect a socket that is down
       // with no attempt running, or whose attempt has been stuck for over a minute.
+      // dingtalk-stream also never clears the old socket's heartbeat timer, which then pings the
+      // new socket while it is still connecting and throws, crashing Mingle (15:06), so clear it
+      // before each reconnect.
       const connectOnce = client.connect.bind(client);
       let closed = false;
       let retryMs = 1_000;
@@ -363,6 +368,7 @@ export function dingtalkChannel(options: DingtalkOptions = {}): Channel {
       client.connect = async () => {
         const started = Date.now();
         attemptSince = started;
+        clearInterval(client.heartbeatIntervallId);
         try {
           await connectOnce();
           retryMs = 1_000;

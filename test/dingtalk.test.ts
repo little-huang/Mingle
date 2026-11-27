@@ -194,6 +194,39 @@ describe("dingtalk connection", () => {
     }
   });
 
+  it("stops the closed socket's heartbeat before reconnecting", async () => {
+    vi.useFakeTimers();
+    try {
+      const stream = fakeStream();
+      const client = stream.client as typeof stream.client & {
+        heartbeatIntervallId?: ReturnType<typeof setInterval>;
+      };
+      let pings = 0;
+      client.connect = async () => {
+        // like dingtalk-stream on open: a keep-alive timer pinging whatever socket is current
+        client.heartbeatIntervallId = setInterval(() => {
+          pings += 1;
+        }, 8_000);
+      };
+      const connection = await dingtalkChannel({
+        api: dingtalkApi(
+          fakeHttp({ "/v1.0/oauth2/accessToken": () => ({ accessToken: "tok", expireIn: 7200 }) }).fetchImpl,
+        ),
+        createClient: () => client,
+      }).connect(
+        { clientId: "ding1", clientSecret: "sec", name: "Alex" },
+        { onMessage: () => {}, onState: () => {}, onMembership: () => {} },
+      );
+      await client.connect(); // the library reconnecting after its socket closed
+      await vi.advanceTimersByTimeAsync(8_000);
+      expect(pings).toBe(1); // one timer, not the old one too
+      await connection.close();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
   it("acknowledges callbacks, replies through the right API, and drives the AI card", async () => {
     const http = fakeHttp({ "/v1.0/oauth2/accessToken": () => ({ accessToken: "tok", expireIn: 7200 }) });
     const stream = fakeStream();
