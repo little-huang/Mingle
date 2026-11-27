@@ -1,7 +1,7 @@
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { InboundMessage, OnboardingEvent } from "../src/channels/channel.ts";
 import { dingtalkApi, dingtalkChannel, type StreamClientLike, toInbound } from "../src/channels/dingtalk/dingtalk.ts";
 import { until } from "./helpers.ts";
@@ -115,6 +115,85 @@ describe("dingtalk onboarding", () => {
 });
 
 describe("dingtalk connection", () => {
+  it("keeps retrying a failed stream reconnect instead of going silent", async () => {
+    vi.useFakeTimers();
+    try {
+      let attempts = 0;
+      const stream = fakeStream();
+      // first connect succeeds; the library's later reconnects (client.connect) fail twice
+      stream.client.connect = async () => {
+        attempts += 1;
+        if (attempts === 2 || attempts === 3) throw new Error("socket disconnected before TLS");
+      };
+      const connection = await dingtalkChannel({
+        api: dingtalkApi(
+          fakeHttp({ "/v1.0/oauth2/accessToken": () => ({ accessToken: "tok", expireIn: 7200 }) }).fetchImpl,
+        ),
+        createClient: () => stream.client,
+      }).connect(
+        { clientId: "ding1", clientSecret: "sec", name: "Alex" },
+        { onMessage: () => {}, onState: () => {}, onMembership: () => {} },
+      );
+      const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+      await stream.client.connect(); // what dingtalk-stream does on socket close
+      expect(attempts).toBe(2);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(attempts).toBe(3);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(attempts).toBe(4); // recovered
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(attempts).toBe(4); // no retries after success
+      expect(errors).toHaveBeenCalledTimes(2);
+      errors.mockRestore();
+      await connection.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reconnects a socket that went down silently or whose reconnect hangs", async () => {
+    vi.useFakeTimers();
+    try {
+      let attempts = 0;
+      const stream = fakeStream();
+      const client = stream.client as typeof stream.client & { connected?: boolean };
+      client.connected = true;
+      // attempt 1 is the first connect; attempt 2 hangs forever; attempt 3 succeeds
+      client.connect = () => {
+        attempts += 1;
+        if (attempts === 2) return new Promise<void>(() => {});
+        client.connected = true;
+        return Promise.resolve();
+      };
+      const connection = await dingtalkChannel({
+        api: dingtalkApi(
+          fakeHttp({ "/v1.0/oauth2/accessToken": () => ({ accessToken: "tok", expireIn: 7200 }) }).fetchImpl,
+        ),
+        createClient: () => client,
+      }).connect(
+        { clientId: "ding1", clientSecret: "sec", name: "Alex" },
+        { onMessage: () => {}, onState: () => {}, onMembership: () => {} },
+      );
+      const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(attempts).toBe(1); // up: the watchdog leaves it alone
+      client.connected = false; // socket closed and the library's own reconnect never ran
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(attempts).toBe(2); // watchdog reconnects; this attempt hangs
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(attempts).toBe(2); // still within a minute
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(attempts).toBe(3); // stuck over a minute: started another, which connects
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(attempts).toBe(3);
+      expect(errors).toHaveBeenCalledTimes(2);
+      errors.mockRestore();
+      await connection.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("acknowledges callbacks, replies through the right API, and drives the AI card", async () => {
     const http = fakeHttp({ "/v1.0/oauth2/accessToken": () => ({ accessToken: "tok", expireIn: 7200 }) });
     const stream = fakeStream();
@@ -205,6 +284,41 @@ describe("dingtalk connection", () => {
     await connection.close();
   });
 
+  it("puts images sent with text inside the markdown, where the text names them", async () => {
+    let media = 0;
+    const http = fakeHttp({
+      "/v1.0/oauth2/accessToken": () => ({ accessToken: "tok", expireIn: 7200 }),
+      "/media/upload": () => ({ errcode: 0, media_id: `@media${++media}` }),
+    });
+    const connection = await dingtalkChannel({
+      api: dingtalkApi(http.fetchImpl),
+      createClient: () => fakeStream().client,
+    }).connect(
+      { clientId: "ding1", clientSecret: "sec" },
+      { onMessage: () => {}, onState: () => {}, onMembership: () => {} },
+    );
+    const dir = await mkdtemp(join(tmpdir(), "mingle-dingtalk-"));
+    for (const name of ["a.png", "b.png", "plan.xlsx"]) await writeFile(join(dir, name), name);
+    const result = await connection.send({
+      chat: { platformId: "cid1", kind: "group" },
+      text: "第 1 项\n\n![图1](evidence/a.png)\n\n第 2 项",
+      files: [{ path: join(dir, "a.png") }, { path: join(dir, "b.png") }, { path: join(dir, "plan.xlsx") }],
+    });
+    expect(result).toMatchObject({ kind: "sent", degraded: [] });
+    const sent = http.calls.filter((c) => c.path === "/v1.0/robot/groupMessages/send").map((c) => c.body);
+    expect(sent).toMatchObject([
+      {
+        msgKey: "sampleMarkdown",
+        msgParam: JSON.stringify({
+          title: "第 1 项",
+          text: "第 1 项\n\n![图1](@media1)\n\n第 2 项\n\n![b.png](@media2)",
+        }),
+      },
+      { msgKey: "sampleFile" },
+    ]);
+    await connection.close();
+  });
+
   it("@-mentions people in a group through a recent message's reply address", async () => {
     const http = fakeHttp({
       "/v1.0/oauth2/accessToken": () => ({ accessToken: "tok", expireIn: 7200 }),
@@ -222,12 +336,17 @@ describe("dingtalk connection", () => {
     const group = { platformId: "cid1", kind: "group" as const };
     const mentions = [{ id: "staff2", name: "李四" }];
 
-    // No message from the group yet: no reply address, so the name goes out as text.
+    // No message from the group yet: no reply address, so the robot API carries the mention.
     expect(await connection.send({ chat: group, text: "@李四 请确认", mentions })).toMatchObject({
       kind: "sent",
-      degraded: ["mentions_plain"],
+      degraded: [],
     });
-    expect(http.calls.filter((c) => c.path === "/v1.0/robot/groupMessages/send")).toHaveLength(1);
+    const viaRobot = http.calls.filter((c) => c.path === "/v1.0/robot/groupMessages/send");
+    expect(viaRobot).toHaveLength(1);
+    expect(viaRobot[0]?.body).toMatchObject({
+      msgKey: "sampleMarkdown",
+      msgParam: JSON.stringify({ title: "@李四 请确认", text: "@staff2 请确认", atUserIds: ["staff2"] }),
+    });
 
     // An address outside dingtalk.com is never used.
     stream.push("cb0", {
@@ -281,7 +400,7 @@ describe("dingtalk connection", () => {
     await connection.close();
   });
 
-  it("sends plainly when DingTalk turns the reply address down", async () => {
+  it("mentions through the robot API when DingTalk turns the reply address down", async () => {
     const http = fakeHttp({
       "/v1.0/oauth2/accessToken": () => ({ accessToken: "tok", expireIn: 7200 }),
       "/robot/sendBySession": () => ({ errcode: 300001, errmsg: "session expired" }),
@@ -310,9 +429,9 @@ describe("dingtalk connection", () => {
         text: "@李四 在吗",
         mentions: [{ id: "staff2", name: "李四" }],
       });
-    expect(await send()).toMatchObject({ kind: "sent", degraded: ["mentions_plain"] });
+    expect(await send()).toMatchObject({ kind: "sent", degraded: [] });
     // The refused address is dropped, not tried again.
-    expect(await send()).toMatchObject({ kind: "sent", degraded: ["mentions_plain"] });
+    expect(await send()).toMatchObject({ kind: "sent", degraded: [] });
     expect(http.calls.filter((c) => c.path === "/robot/sendBySession")).toHaveLength(1);
     expect(http.calls.filter((c) => c.path === "/v1.0/robot/groupMessages/send")).toHaveLength(2);
     await connection.close();
